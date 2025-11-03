@@ -1,80 +1,79 @@
-
 from flask import Blueprint, request, jsonify
-import sqlite3, os, json, time
+import os, json, time
 from ai_classifier import classify, CATEGORIES
 
+# ---------------------------------------------
+# JSON Database Setup
+# ---------------------------------------------
 ROOT = os.path.dirname(__file__)
-DB_PATH = os.path.join(ROOT, "gschool.db")
-
+DB_FILE = os.path.join(ROOT, "gschool.json")
 ai = Blueprint("ai", __name__, url_prefix="/api/ai")
 
-def _db():
-    return sqlite3.connect(DB_PATH)
+# ---------------------------------------------
+# Helper functions
+# ---------------------------------------------
+def _load_db():
+    if not os.path.exists(DB_FILE):
+        return {"categories": {}, "settings": {}, "chat_messages": []}
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"categories": {}, "settings": {}, "chat_messages": []}
+
+def _save_db(data):
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 def ensure_schema():
-    with _db() as conn:
-        cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS categories(
-            name TEXT PRIMARY KEY,
-            blocked INTEGER DEFAULT 0,
-            block_url TEXT
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS settings(
-            k TEXT PRIMARY KEY,
-            v TEXT
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS chat_messages(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room TEXT,
-            user_id TEXT,
-            role TEXT,
-            text TEXT,
-            ts INTEGER
-        )""")
-        # seed categories if empty
-        cur.execute("SELECT COUNT(*) FROM categories")
-        if cur.fetchone()[0] == 0:
-            for c in CATEGORIES:
-                cur.execute("INSERT OR IGNORE INTO categories(name, blocked, block_url) VALUES(?,?,?)", (c, 0, None))
-        conn.commit()
+    db = _load_db()
+    # seed categories if missing
+    if "categories" not in db:
+        db["categories"] = {}
+    for c in CATEGORIES:
+        if c not in db["categories"]:
+            db["categories"][c] = {"blocked": False, "block_url": None}
+    if "settings" not in db:
+        db["settings"] = {}
+    if "chat_messages" not in db:
+        db["chat_messages"] = []
+    _save_db(db)
 
 def get_setting(key, default=None):
-    with _db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT v FROM settings WHERE k=?", (key,))
-        row = cur.fetchone()
-        return json.loads(row[0]) if row and row[0] else default
+    db = _load_db()
+    return db.get("settings", {}).get(key, default)
 
 def set_setting(key, value):
-    with _db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO settings(k,v) VALUES(?,?)", (key, json.dumps(value)))
-        conn.commit()
+    db = _load_db()
+    db.setdefault("settings", {})[key] = value
+    _save_db(db)
 
-@ai.route("/categories", methods=["GET","POST"])
+# ---------------------------------------------
+# Routes
+# ---------------------------------------------
+@ai.route("/categories", methods=["GET", "POST"])
 def categories():
     ensure_schema()
+    db = _load_db()
+
     if request.method == "POST":
         body = request.json or {}
         name = body.get("name")
-        blocked = 1 if body.get("blocked") else 0
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+        blocked = bool(body.get("blocked"))
         block_url = body.get("block_url")
-        if not name: return jsonify({"ok":False,"error":"name required"}),400
-        with _db() as conn:
-            cur = conn.cursor()
-            cur.execute("INSERT OR IGNORE INTO categories(name, blocked, block_url) VALUES(?,?,?)",
-                        (name, blocked, block_url))
-            cur.execute("UPDATE categories SET blocked=?, block_url=? WHERE name=?",
-                        (blocked, block_url, name))
-            conn.commit()
-        return jsonify({"ok":True})
+        db["categories"][name] = {"blocked": blocked, "block_url": block_url}
+        _save_db(db)
+        return jsonify({"ok": True})
     else:
-        with _db() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT name, blocked, block_url FROM categories ORDER BY name")
-            rows = [{"name":n,"blocked":bool(b),"block_url":u} for (n,b,u) in cur.fetchall()]
-        return jsonify({"ok":True,"categories":rows})
+        cats = [{"name": n, **v} for n, v in sorted(db["categories"].items())]
+        return jsonify({"ok": True, "categories": cats})
 
+# ---------------------------------------------
+# AI Classifier
+# ---------------------------------------------
 @ai.route("/classify", methods=["POST"])
 def api_classify():
     ensure_schema()
@@ -82,19 +81,19 @@ def api_classify():
     url = body.get("url") or ""
     html = body.get("html")
     result = classify(url, html)
-    # policy
-    with _db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT blocked, block_url FROM categories WHERE name=?", (result["category"],))
-        row = cur.fetchone()
-        blocked = bool(row[0]) if row else False
-        cat_block_url = row[1] if row else None
+
+    db = _load_db()
+    cat_data = db.get("categories", {}).get(result["category"], {"blocked": False, "block_url": None})
+    blocked = bool(cat_data.get("blocked"))
+    cat_block_url = cat_data.get("block_url")
 
     default_redirect = get_setting("blocked_redirect", "https://blocked.gdistrict.org/Gschool%20block")
     final_block_url = cat_block_url or default_redirect
-    return jsonify({"ok":True, "url":url, "result":result, "blocked":blocked, "block_url": final_block_url})
+    return jsonify({"ok": True, "url": url, "result": result, "blocked": blocked, "block_url": final_block_url})
 
-# Simple REST chat as a fallback
+# ---------------------------------------------
+# Simple Chat System
+# ---------------------------------------------
 @ai.route("/chat/send", methods=["POST"])
 def chat_send():
     ensure_schema()
@@ -103,23 +102,26 @@ def chat_send():
     user_id = b.get("user_id") or "unknown"
     role = b.get("role") or "student"
     text = (b.get("text") or "").strip()[:1000]
-    if not text: return jsonify({"ok":False,"error":"empty"}),400
-    ts = int(time.time()*1000)
-    with _db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO chat_messages(room,user_id,role,text,ts) VALUES(?,?,?,?,?)",
-                    (room,user_id,role,text,ts))
-        conn.commit()
-    return jsonify({"ok":True,"ts":ts})
+    if not text:
+        return jsonify({"ok": False, "error": "empty"}), 400
+
+    ts = int(time.time() * 1000)
+    db = _load_db()
+    db.setdefault("chat_messages", []).append({
+        "room": room,
+        "user_id": user_id,
+        "role": role,
+        "text": text,
+        "ts": ts
+    })
+    _save_db(db)
+    return jsonify({"ok": True, "ts": ts})
 
 @ai.route("/chat/poll", methods=["GET"])
 def chat_poll():
     ensure_schema()
-    room = request.args.get("room","*")
-    since = int(request.args.get("since","0") or 0)
-    with _db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, role, text, ts FROM chat_messages WHERE room=? AND ts>? ORDER BY ts ASC",
-                    (room, since))
-        rows = [{"user_id":u,"role":r,"text":t,"ts":ts} for (u,r,t,ts) in cur.fetchall()]
-    return jsonify({"ok":True,"messages":rows})
+    room = request.args.get("room", "*")
+    since = int(request.args.get("since", "0") or 0)
+    db = _load_db()
+    msgs = [m for m in db.get("chat_messages", []) if m["room"] == room and m["ts"] > since]
+    return jsonify({"ok": True, "messages": msgs})
