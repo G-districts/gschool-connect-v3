@@ -1,10 +1,10 @@
 # =========================
-# G-SCHOOLS CONNECT BACKEND
+# G-SCHOOLS CONNECT BACKEND (Cloudflare-Compatible)
 # =========================
 
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from flask_cors import CORS
-import json, os, time, sqlite3, traceback, uuid, re
+import json, os, time, traceback, uuid, re
 from urllib.parse import urlparse
 
 # ---------------------------
@@ -16,54 +16,16 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 ROOT = os.path.dirname(__file__)
 DATA_PATH = os.path.join(ROOT, "data.json")
-DB_PATH = os.path.join(ROOT, "gschool.db")
 SCENES_PATH = os.path.join(ROOT, "scenes.json")
 
-
 # =========================
-# Helpers: Data & Database
+# Helpers: Data Handling
 # =========================
-
-def db():
-    """Open sqlite connection (row factory stays default to keep light)."""
-    con = sqlite3.connect(DB_PATH)
-    return con
-
-def _init_db():
-    """Create tables if missing; repair structure when possible."""
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            k TEXT PRIMARY KEY,
-            v TEXT
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            password TEXT,
-            role TEXT
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room TEXT,
-            user_id TEXT,
-            role TEXT,
-            text TEXT,
-            ts INTEGER
-        );
-    """)
-    con.commit()
-    con.close()
-
-_init_db()
 
 def _safe_default_data():
     return {
         "settings": {"chat_enabled": False},
+        "users": {},  # store users inline instead of sqlite
         "classes": {
             "period1": {
                 "name": "Period 1",
@@ -87,10 +49,8 @@ def _safe_default_data():
     }
 
 def _coerce_to_dict(obj):
-    """If file accidentally became a list or invalid type, coerce to default dict."""
     if isinstance(obj, dict):
         return obj
-    # Attempt to stitch a list of dict fragments
     if isinstance(obj, list):
         d = _safe_default_data()
         for item in obj:
@@ -99,8 +59,32 @@ def _coerce_to_dict(obj):
         return d
     return _safe_default_data()
 
+def ensure_keys(d):
+    d.setdefault("settings", {}).setdefault("chat_enabled", False)
+    d.setdefault("users", {})
+    d.setdefault("classes", {}).setdefault("period1", {
+        "name": "Period 1",
+        "active": True,
+        "focus_mode": False,
+        "paused": False,
+        "allowlist": [],
+        "teacher_blocks": [],
+        "students": []
+    })
+    d.setdefault("categories", {})
+    d.setdefault("pending_commands", {})
+    d.setdefault("pending_per_student", {})
+    d.setdefault("presence", {})
+    d.setdefault("history", {})
+    d.setdefault("screenshots", {})
+    d.setdefault("alerts", [])
+    d.setdefault("dm", {})
+    d.setdefault("audit", [])
+    d.setdefault("extension_enabled", True)
+    return d
+
 def load_data():
-    """Load JSON with self-repair for common corruption patterns."""
+    """Load JSON with fallback and repair logic."""
     if not os.path.exists(DATA_PATH):
         d = _safe_default_data()
         save_data(d)
@@ -110,10 +94,8 @@ def load_data():
             obj = json.load(f)
             return ensure_keys(_coerce_to_dict(obj))
     except json.JSONDecodeError as e:
-        # Try simple auto-repair: merge stray blocks like "} {"
         try:
             text = open(DATA_PATH, "r", encoding="utf-8").read().strip()
-            # Fix common '}{' issues
             text = re.sub(r"}\s*{", "},{", text)
             if not text.startswith("["):
                 text = "[" + text
@@ -137,49 +119,21 @@ def save_data(d):
     with open(DATA_PATH, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2)
 
+# ---------------------------
+# Settings / Users / Logs
+# ---------------------------
+
 def get_setting(key, default=None):
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT v FROM settings WHERE k=?", (key,))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return default
-    try:
-        return json.loads(row[0])
-    except Exception:
-        return row[0]
+    d = load_data()
+    return d["settings"].get(key, default)
 
 def set_setting(key, value):
-    con = db(); cur = con.cursor()
-    cur.execute("REPLACE INTO settings (k, v) VALUES (?,?)", (key, json.dumps(value)))
-    con.commit(); con.close()
+    d = load_data()
+    d["settings"][key] = value
+    save_data(d)
 
 def current_user():
     return session.get("user")
-
-def ensure_keys(d):
-    d.setdefault("settings", {}).setdefault("chat_enabled", False)
-    d.setdefault("classes", {}).setdefault("period1", {
-        "name": "Period 1",
-        "active": True,
-        "focus_mode": False,
-        "paused": False,
-        "allowlist": [],
-        "teacher_blocks": [],
-        "students": []
-    })
-    d.setdefault("categories", {})
-    d.setdefault("pending_commands", {})
-    d.setdefault("pending_per_student", {})
-    d.setdefault("presence", {})
-    d.setdefault("history", {})
-    d.setdefault("screenshots", {})
-    d.setdefault("alerts", [])
-    d.setdefault("dm", {})
-    d.setdefault("audit", [])
-    # also carry feature flags
-    d.setdefault("extension_enabled", True)
-    return d
 
 def log_action(entry):
     try:
@@ -190,8 +144,8 @@ def log_action(entry):
         log.append(entry)
         d["audit"] = log[-500:]
         save_data(d)
-    except Exception:
-        pass
+    except Exception as e:
+        print("log_action failed:", e)
 
 
 # =========================
